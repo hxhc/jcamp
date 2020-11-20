@@ -1,8 +1,10 @@
 # -*- coding: UTF-8 -*-
 # See the LICENSE.rst file for licensing information.
 
-from numpy import array, linspace, amin, amax, alen, append, arange, float64, logical_and, logical_not, log10, nan
+from numpy import array, linspace, alen, append, arange, logical_not, log10, nan
 import re
+from six import string_types
+import pdb
 
 '''
 jcamp.py contains functions useful for parsing JCAMP-DX formatted files containing spectral data. The main
@@ -18,8 +20,30 @@ __license__ = 'MIT/X11 License'
 __contact__ = 'Nathan Hagen <and.the.light.shattered@gmail.com>'
 __all__     = ['JCAMP_reader', 'JCAMP_calc_xsec', 'is_float']
 
+SQZ_digits = {
+    '@':'+0', 'A':'+1', 'B':'+2', 'C':'+3', 'D':'+4', 'E':'+5', 'F':'+6', 'G':'+7', 'H':'+8', 'I':'+9',
+    'a':'-1', 'b':'-2', 'c':'-3', 'd':'-4', 'e':'-5', 'f':'-6', 'g':'-7', 'h':'-8', 'i':'-9',
+    '+':'+', ## For PAC
+    '-':'-', ## For PAC
+    ',':' ', ## For CSV
+}
+DIF_digits = {
+    '%': 0, 'J':1,  'K':2,  'L':3,  'M':4,  'N':5,  'O':6,  'P':7,  'Q':8,  'R':9,
+            'j':-1, 'k':-2, 'l':-3, 'm':-4, 'n':-5, 'o':-6, 'p':-7, 'q':-8, 'r':-9,
+}
+DUP_digits = {
+    'S':1, 'T':2, 'U':3, 'V':4, 'W':5, 'X':6, 'Y':7, 'Z':8, 's':9,
+}
+
 ##=====================================================================================================
 def JCAMP_reader(filename):
+    with open(filename, 'rb') as filehandle:
+        data = jcamp_read(filehandle)
+    data['filename'] = filename
+    return data
+
+##=====================================================================================================
+def jcamp_read(filehandle):
     '''
     Read a JDX-format file, and return a dictionary containing the header info, a 1D numpy vectors `x` for
     the abscissa information (e.g. wavelength or wavenumber) and `y` for the ordinate information (e.g.
@@ -27,8 +51,8 @@ def JCAMP_reader(filename):
 
     Parameters
     ----------
-    filename : str
-        The JCAMP-DX filename to read.
+    filehandle : str
+        The object representing the JCAMP-DX filename to read.
 
     Returns
     -------
@@ -36,20 +60,45 @@ def JCAMP_reader(filename):
         The dictionary containing the header and data vectors.
     '''
 
-    filehandle = open(filename, 'r')
-    jcamp_dict = {'filename':filename}
+    jcamp_dict = {}
     xstart = []
     xnum = []
     y = []
     x = []
     datastart = False
-    jcamp_numbers_pattern = re.compile(r'([+-]?\d+[.]?\d*[eE][+-]{1}\d+|[+-]?\d+\.\d*)|([+-]?\d+)')
-    #re_le = re.compile(r'\(0\.{2}\d+\)')
+    is_compound = False
+    in_compound_block = False
+    compound_block_contents = []
     re_num = re.compile(r'\d+')
+    lhs = None
     for line in filehandle:
+        ## When parsing compound files, the input is an array of strings, so no need to decode it twice.
+        if hasattr(line, 'decode'):
+            line = line.decode('utf-8','ignore')
+
         if not line.strip():
             continue
         if line.startswith('$$'):
+            continue
+
+        ## Detect the start of a compound block
+        if is_compound and line.upper().startswith('##TITLE'):
+            in_compound_block = True
+            compound_block_contents = [line]
+            continue
+
+        ## If we are reading a compound block, collect lines into an array to be processed by a
+        ## recursive call this this function.
+        if in_compound_block:
+            ## Store this line.
+            compound_block_contents.append(line)
+
+            ## Detect the end of the compound block.
+            if line.upper().startswith('##END'):
+                ## Process the entire block and put it into the children array.
+                jcamp_dict['children'].append(jcamp_read(compound_block_contents))
+                in_compound_block = False
+                compound_block_contents = []
             continue
 
         ## Lines beginning with '##' are header lines.
@@ -67,7 +116,16 @@ def JCAMP_reader(filename):
             else:
                 jcamp_dict[lhs] = rhs
 
+            ## Detect compound files.
+            ## See table XI in http://www.jcamp-dx.org/protocols/dxir01.pdf
+            if (lhs in {'data type', 'datatype'}) and (rhs.lower() == 'link'):
+                is_compound = True
+                jcamp_dict['children'] = []
+
             if (lhs in ('xydata','xypoints','peak table')):
+                ## This is a new data entry, reset x and y.
+                x = []
+                y = []
                 datastart = True
                 datatype = rhs
                 continue        ## data starts on next line
@@ -76,33 +134,29 @@ def JCAMP_reader(filename):
                 datastart = True
                 datatype = bounds
                 datalist = []
-                jcamp_dict[lhs] = datalist
                 continue
             elif datastart:
-                if (lhs == 'end' or len(datalist)==(bounds[1]+1)):
-                    datastart = False
+                datastart = False
+        elif lhs is not None and not datastart:  # multiline entry
+            jcamp_dict[lhs] += '\n{}'.format(line.strip())
 
         if datastart and (datatype == '(X++(Y..Y))'):
             ## If the line does not start with '##' or '$$' then it should be a data line.
             ## The pair of lines below involve regex splitting on floating point numbers and integers. We can't just
             ## split on spaces because JCAMP allows minus signs to replace spaces in the case of negative numbers.
-            new = re.split(jcamp_numbers_pattern, line.strip())
-            new = [n for n in new if n != '' and n is not None]
-            datavals = [n for n in new if n.strip() != '']
-
-            if not all(is_float(datavals)): continue
+            datavals = jcamp_parse(line)
             xstart.append(float(datavals[0]))
             xnum.append(len(datavals) - 1)
             for dataval in datavals[1:]:
                 y.append(float(dataval))
         elif datastart and (('xypoints' in jcamp_dict) or ('xydata' in jcamp_dict)) and (datatype == '(XY..XY)'):
-            datavals = [v.strip() for v in re.split(r"[, ]", line) if v]  ## be careful not to allow empty strings
+            datavals = [v.strip() for v in re.split(r"[,;\s]", line) if v]  ## be careful not to allow empty strings
             if not all(is_float(datavals)): continue
             datavals = array(datavals)
             x.extend(datavals[0::2])        ## every other data point starting at the zeroth
             y.extend(datavals[1::2])        ## every other data point starting at the first
         elif datastart and ('peak table' in jcamp_dict) and (datatype == '(XY..XY)'):
-            datavals = [v.strip() for v in re.split(r"[, ]", line) if v]  ## be careful not to allow empty strings
+            datavals = [v.strip() for v in re.split(r"[,;\s]", line) if v]  ## be careful not to allow empty strings
             if not all(is_float(datavals)): continue
             datavals = array(datavals)
             x.extend(datavals[0::2])        ## every other data point starting at the zeroth
@@ -111,14 +165,7 @@ def JCAMP_reader(filename):
             ## If the line does not start with '##' or '$$' then it should be a data line.
             ## The pair of lines below involve regex splitting on floating point numbers and integers. We can't just
             ## split on spaces because JCAMP allows minus signs to replace spaces in the case of negative numbers.
-            new = re.split(jcamp_numbers_pattern, line.strip())
-            new = [n for n in new if n != '' and n is not None]
-            datavals = [n for n in new if n.strip() != '']
-
-            if all(is_float(datavals)):
-                for i,dataval in enumerate(datavals):
-                    datavals[i] = float(dataval)
-
+            datavals = jcamp_parse(line)
             datalist += datavals
 
     if ('xydata' in jcamp_dict) and (jcamp_dict['xydata'] == '(X++(Y..Y))'):
@@ -126,21 +173,32 @@ def JCAMP_reader(filename):
         ## First look for the "lastx" dictionary entry. You will need that one to finish the set.
         xstart.append(jcamp_dict['lastx'])
         x = array([])
-        for n in range(len(xnum)):
-            x = append(x, linspace(xstart[n],xstart[n+1],xnum[n]))
-        y = array(y)
+        for n in range(len(xnum)-1):
+            dx = (xstart[n+1] - xstart[n]) / xnum[n]
+            x = append(x, xstart[n]+(dx*arange(xnum[n])))
+            #print(n, xstart[n], xstart[n+1], xnum[n], xstart[n]+(dx*arange(xnum[n])))
+
+        ## The last line must be treated separately.
+        if (xnum[len(xnum)-1] > 1):
+            dx = (jcamp_dict['lastx'] - xstart[len(xnum)-1]) / (xnum[len(xnum)-1] - 1.0)
+            x = append(x, xstart[len(xnum)-1]+(dx*arange(xnum[len(xnum)-1])))
+            #print(n, xstart[len(xnum)-1]+(dx*arange(xnum[len(xnum)-1])))
+        else:
+            x = append(x, jcamp_dict['lastx'])
+
+        y = array([float(yval) for yval in y])
     else:
         x = array([float(xval) for xval in x])
         y = array([float(yval) for yval in y])
 
     ## The "xfactor" and "yfactor" variables contain any scaling information that may need to be applied
     ## to the data. Go ahead and apply them.
-    if ('xfactor' in jcamp_dict): x = x * jcamp_dict['xfactor']
-    if ('yfactor' in jcamp_dict): y = y * jcamp_dict['yfactor']
+    if ('xfactor' in jcamp_dict):
+        x = x * jcamp_dict['xfactor']
+    if ('yfactor' in jcamp_dict):
+        y = y * jcamp_dict['yfactor']
     jcamp_dict['x'] = x
     jcamp_dict['y'] = y
-
-    filehandle.close()
 
     return(jcamp_dict)
 
@@ -282,7 +340,7 @@ def is_float(s):
     '''
 
     if isinstance(s,tuple) or isinstance(s,list):
-        if not all(isinstance(i,str) for i in s):
+        if not all(isinstance(i, string_types) for i in s):
             raise TypeError("Input {} is not a list of strings".format(s))
         if (len(s) == 0):
             raise ValueError('Input {} is empty'.format(s))
@@ -295,12 +353,85 @@ def is_float(s):
                     bool[i] = False
         return(bool)
     else:
-        if not isinstance(s,str): raise TypeError("Input '%s' is not a string" % (s))
+        if not isinstance(s, string_types):
+            raise TypeError("Input '%s' is not a string" % (s))
+
         try:
             float(s)
             return(True)
         except ValueError:
             return(False)
+
+##=====================================================================================================
+def get_value(num, is_dif, vals):
+    n = float(num)
+    if is_dif:
+        lastval = vals[-1]
+        val = n + lastval
+    else:
+        val = n
+
+    return(val)
+
+##=====================================================================================================
+def jcamp_parse(line):
+    line = line.strip()
+
+    datavals = []
+    num = ""
+
+    ## Convert whitespace into single space by splitting the string then re-assembling with single spaces.
+    line = ' '.join(line.split())
+
+    ## If there are any coded digits, then replace the codes with the appropriate numbers.
+    ## 'DUP_digits' are characters that represent how many times the previous character should be replicated.
+    ## 'DIF_digits' represent ...?
+    ## 'SQZ_digits' represent ...?
+    DUP_set = set(DUP_digits)
+
+    if any(c in DUP_set for c in line):
+        ## Split the line into individual characters so that you can check for coded characters one-by-one.
+        newline = ''
+        for (i,c) in enumerate(line):
+            if (c in DUP_digits):
+                prev_c = line[i-1]
+                mul = DUP_digits[c]
+                newline += prev_c*mul
+            else:
+                mul = ''
+                newline += c
+        line = "".join(newline)
+
+    DIF = False
+    for c in line:
+        if c.isdigit() or (c == "."):
+            num += c
+        elif (c == ' '):
+            DIF = False
+            if num:
+                n = get_value(num, DIF, datavals)
+                datavals.append(n)
+            num = ''
+        elif (c in SQZ_digits):
+            DIF = False
+            if num:
+                n = get_value(num, DIF, datavals)
+                datavals.append(n)
+            num = SQZ_digits[c]
+        elif (c in DIF_digits):
+            if num:
+                n = get_value(num, DIF, datavals)
+                datavals.append(n)
+            DIF = True
+            num = str(DIF_digits[c])
+        else:
+            raise Exception("Unknown character (%s) encountered while parsing data" % c)
+
+    if num:
+        n = get_value(num, DIF, datavals)
+        datavals.append(n)
+
+    return(datavals)
 
 ## =================================================================================================
 ## =================================================================================================
@@ -345,5 +476,31 @@ if (__name__ == '__main__'):
     plt.title(filename)
     plt.xlabel(jcamp_dict['xunits'])
     plt.ylabel(jcamp_dict['yunits'])
+
+    filename = './data/neutron_scattering_spectra/emodine.jdx'
+    jcamp_dict = JCAMP_reader(filename)
+    plt.figure()
+    plt.plot(jcamp_dict['x'], jcamp_dict['y'], 'k-')
+    plt.title(filename)
+    plt.xlabel(jcamp_dict['xunits'])
+    plt.ylabel(jcamp_dict['yunits'])
+
+    filename = './data/infrared_spectra/example_compound_file.jdx'
+    jcamp_dict = JCAMP_reader(filename)
+    plt.figure()
+    for c in jcamp_dict['children']:
+        plt.plot(c['x'], c['y'])
+    plt.xlabel(jcamp_dict['children'][0]['xunits'])  # assume all blocks have the same units
+    plt.ylabel(jcamp_dict['children'][0]['yunits'])
+    plt.title(filename)
+
+    filename = './data/infrared_spectra/example_multiline_datasets.jdx'
+    jcamp_dict = JCAMP_reader(filename)
+    plt.figure()
+    plt.plot(jcamp_dict['x'], jcamp_dict['y'])
+    plt.title(filename)
+    plt.xlabel(jcamp_dict['xunits'])
+    plt.ylabel(jcamp_dict['yunits'])
+    plt.text(500, 0.95, jcamp_dict['comments'])
 
     plt.show()
